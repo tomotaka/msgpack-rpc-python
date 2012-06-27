@@ -7,6 +7,7 @@ from msgpackrpc.future import Future
 from msgpackrpc.transport import tcp
 from msgpackrpc.compat import iteritems
 
+from tornado.ioloop import IOLoop
 
 class Session(object):
     """\
@@ -21,7 +22,7 @@ class Session(object):
     result to the corresponding future.
     """
 
-    def __init__(self, address, timeout, loop=None, builder=tcp, reconnect_limit=5, pack_encoding='utf-8', unpack_encoding=None):
+    def __init__(self, address, timeout, loop=None, builder=tcp, reconnect_limit=5, pack_encoding='utf-8', unpack_encoding=None, tornado=False):
         """\
         :param address: address of the server.
         :param loop:    context object.
@@ -34,6 +35,8 @@ class Session(object):
         self._transport = builder.ClientTransport(self, self._address, reconnect_limit, encodings=(pack_encoding, unpack_encoding))
         self._generator = _NoSyncIDGenerator()
         self._request_table = {}
+        self._tornado = tornado
+        self._request_callbacks = {}
 
     @property
     def address(self):
@@ -45,6 +48,12 @@ class Session(object):
     def call_async(self, method, *args):
         return self.send_request(method, args)
 
+    def call_with_callback(self, method, *args, **kwargs): # tomotaka
+        callback = kwargs['callback']
+        msgid = next(self._generator)
+        self._request_callbacks[msgid] = callback
+        self._transport.send_message([message.REQUEST, msgid, method, args])
+
     def send_request(self, method, args):
         # need lock?
         msgid = next(self._generator)
@@ -55,15 +64,17 @@ class Session(object):
 
     def notify(self, method, *args):
         def callback():
-            self._loop.stop()
+            self.stop_loop()
+        
         self._transport.send_message([message.NOTIFY, method, args], callback=callback)
-        self._loop.start()
+        self.start_loop()
 
     def close(self):
         if self._transport:
             self._transport.close()
         self._transport = None
         self._request_table = {}
+        self._request_callbacks = {}
 
     def on_connect_failed(self, reason):
         """
@@ -76,7 +87,7 @@ class Session(object):
 
         self._request_table = {}
         self.close()
-        self._loop.stop()
+        self.stop_loop()
 
     def on_response(self, msgid, error, result):
         """\
@@ -84,17 +95,27 @@ class Session(object):
         Called by the transport layer.
         """
 
-        if not msgid in self._request_table:
+        if (not msgid in self._request_table) and (not msgid in self._request_callbacks):
             # TODO: Check timed-out msgid?
             #raise RPCError("Unknown msgid: id = {0}".format(msgid))
             return
-        future = self._request_table.pop(msgid)
 
-        if error is not None:
-            future.set_error(error)
-        else:
-            future.set_result(result)
-        self._loop.stop()
+        if msgid in self._request_table:
+            future = self._request_table.pop(msgid)
+
+            if error is not None:
+                future.set_error(error)
+            else:
+                future.set_result(result)
+        elif msgid in self._request_callbacks:
+            callback = self._request_callbacks.pop(msgid)
+            
+            if error is not None:
+                callback(None)
+            else:
+                callback(result)
+
+        self.stop_loop()
 
     def on_timeout(self, msgid):
         future = self._request_table.pop(timeout)
@@ -109,11 +130,21 @@ class Session(object):
         if len(timeouts) == 0:
             return
 
-        self._loop.stop()
+        if not self._tornado:
+            self._loop.stop()
         for timeout in timeouts:
             future = self._request_table.pop(timeout)
             future.set_error("Request timed out")
-        self._loop.start()
+        if not self._tornado:
+            self._loop.start()
+
+    def start_loop(self):
+        if not self._tornado:
+            self._loop.start()
+
+    def stop_loop(self):
+        if not self._tornado:
+            self._loop.stop()
 
 
 def _NoSyncIDGenerator():
